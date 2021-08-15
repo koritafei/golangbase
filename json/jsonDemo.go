@@ -1,26 +1,34 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-
-	json "github.com/bitly/go-simplejson"
+	"strings"
 )
 
 func main() {
-	val := []byte("{\"code\":0,\"result\":{\"app_wm\":\"123\"}}")
-
-	jsonval, err := json.NewJson(val)
-	if err != nil {
-		fmt.Printf("Error creating JSON, val: %v, err: %s", val, err.Error())
-		return
+	str := "aaa^ssss^ccc^aaaaaa"
+	fmt.Println(str)
+	v, e := json.Marshal(str)
+	if e != nil {
+		panic(e)
 	}
 
-	app_wm, err := jsonval.Get("result").Get("app_wm").String()
-	if err != nil {
-		fmt.Printf("App_wm Get error: %v", err.Error())
-		return
+	fmt.Printf("%v\n", v)
+	fmt.Printf("%v\n", string(v))
+
+	a := ""
+	e = json.Unmarshal(v, &a)
+
+	if e != nil {
+		panic(e)
 	}
 
-	fmt.Printf("app_wm = %s\nlen(app_wm) = %d\n", app_wm, len(app_wm))
+	fmt.Printf("%v\n", a)
+
+	arr := strings.Split(string(a), "^")
+
+	fmt.Printf("arr %v\n", arr)
+
 	return
 }

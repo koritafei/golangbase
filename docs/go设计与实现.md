@@ -100,8 +100,16 @@ type SliceHeader struct {
 冲突解决：
 1. 开放寻址法
    `key`发生冲突时，则将依次探索下一个空白地址处。
+   $index := hash("author") \% array.len $
+   ![链式地址](./images/开放地址法.png)
+   `get与set`操作：
+   ![getandset](./images/setandget.png)
+
+
 2. 拉链法
    将冲突的`key`存入到一个链表中。
+   ![拉链法](./images/拉链法.png)
+   
 
 #### 哈希表实现
 ```go
@@ -111,8 +119,8 @@ type hmap struct {
   B uint8 // 哈希表持有的buckets个数
   noverflow uint8
   hash0 uint32 // 哈希种子
-  buckets unsafe.Pointer // 哈希表扩容时保存的之前的buckets字段，当前buckets大小的一半
-  oldbuckets unsafe.Pointer
+  buckets unsafe.Pointer 
+  oldbuckets unsafe.Pointer // 哈希表扩容时保存的之前的buckets字段，当前buckets大小的一半
   nevacuate uintptr
   extra *mapextra
 }
@@ -128,6 +136,132 @@ type bmap struct {
   overflow uintptr
 }
 ```
+`hash`元素个数超过`25`个时，`key和val`分别存储到`两个数组`中。如下图：
+![hashtable](./images/hash表结构.png)
+![hash结构图](./images/hash结构图.png)
+![hashmapaccess](./images/hashmapaccess.png)
+在初始化`map`时，桶的个数下于$2^4$时，使用溢出桶的概率较小；
+否则需要创建$2^{B-4}$个溢出桶。
+#### 哈希表扩容
+扩容的时机：
+1. 装载因子超过6.5;
+2. 哈希使用了太多溢出桶。触发等量扩容。
+
+扩容方式：
+1. 等量扩容(sameSizeGrow).
+   由溢出桶太多导致的.如果我们持续插入数据并将其删除，如果hash表中数据没有超出阈值，就会引起缓慢的内存溢出(`runtime: limit the number of map overflow buckets`)。
+   ![等量扩容](./images/等量扩容.png)
+   等量扩容创建了和原来相同的桶数，不会进行数据拷贝。
+2. 正常扩容
+  ![正常扩容](./images/正常扩容.png)
+### 字符串
+![stringinmem](images/stringinmem.png)
+```go
+type StringHeader struct {
+  Data uintptrt
+  Len int
+}
+```
+字符串是只读的，采用直接链接的方式极耗性能。
+### 函数调用
+`C`与`GO`函数调用区别：
+1. `C`语言使用寄存器与栈传递参数，使用`eax`寄存器传递返回值；
+2. `GO`使用栈传递参数与返回值。
+
+两种实现方式的优缺点：
+1. `C`语言的实现方式极大的减少了函数调用的开销，但增加了实现的复杂度：
+   * `CPU`访问栈的开销比寄存器高几十倍；
+   * 需要单独处理函数参数过多的情况。
+
+2. `GO`的实现方式降低了实现的复杂度并支持多返回值,但牺牲了函数调用性能：
+   * 不需要考虑超过寄存器数量的参数如何传递；
+   * 不需要考虑不同架构上寄存器的差异；
+   * 函数出参与入参所需空间都在站上分配.
+
+#### 参数传递
+1. `golang`中对整形和数组参数传递的方式为值传递。
+2. `golang`中所有函数参数均为值传递。
+
+总结：
+1. 通过堆栈传递函数，入栈顺序从右到左；
+2. 函数返回值通过堆栈传递由调用者预先分内存；
+3. 调用函数都是传值，接收方会对入参进行复制在计算。
+
+### 接口
+上下游通过接口进行解耦。
+![interface](./images/interface.png)
+接口分为`iface`与`eface`两种.
+`eface`是空接口,结构如下：
+```go
+type eface struct {
+  _type *_type
+  data unsafe.Pointer
+}
+```
+`iface`的结构如下：
+```go
+type iface struct {
+  tab *itab
+  data unsafe.Pointer
+}
+```
+类型`_type`结构体：
+```go
+type _type struct{
+  size uintptr
+  ptrdata uintptr
+  hash uint32
+  tflag tflag
+  align uint8
+  fieldAglin uint8
+  kind uint8
+  equal func(unsafe.Pointer, unsafe.Pointer) bool
+  gcdata *byte
+  str nameOff
+  ptrToThis typeOff
+}
+```
+`itab`结构体：
+```go
+type itab struct {
+  inter *interfacetype
+  _type *_type
+  hash uint32
+  _ [4]byte
+  func [1]uintptr
+}
+```
+#### 动态派发(`Dynamic dispatch`)
+动态派发(Dynamic dispatch)是在运行期间选择具体多态操作(方法或者函数)执行的过程,它是一种在面向对象语言中常见的特性.
+### 反射
+`golang`反射主要有两对非常重要的函数与类型。
+
+| 类型             | 含义               |
+| ---------------- | ------------------ |
+| `refect.TypeOf`  | 获取类型信息       |
+| `refect.ValueOf` | 获取数据运行时表示 |
+
+#### 三大法则
+1. 从`interface{}`对象可以反射出反射对象；
+2. 从反射对象可以获取到`interface{}`变量；
+3. 要修改反射对象，其值必须可设置。
+
+![接口与反射](./images/接口与反射.png)
+针对第三法则，需要修改一个反射的`value`需要进行以下操作：
+1. 调用`refect.ValueOf`获取变量指针;
+2. 调用`refect.Value.Elem`获取指针指向的变量；
+3. 调用`refect.Value.SetInt`方法更新变量值。
+
+#### 类型和值
+`interface{}`在语言内部是通过`emptyInterface`结构体表示的。
+```go
+type emptyInterface struct {
+  typ *rtype // 变量类型
+  word unsafe.Pointer // 内部封装数据
+}
+```
+
+## 常用关键字
 
 
 
