@@ -262,9 +262,80 @@ type emptyInterface struct {
 ```
 
 ## 常用关键字
+### `select`
+`select` 控制结构时，存在以下两种现象：
+1. `select`在`Channel`上进行非阻塞的收发操作；
+2. 多个`Channel`响应时会随机挑选`case`执行。(主要是防止饥饿问题发生)
+
+`select`非阻塞收发，必须含`default`子句；如果存在`case`就绪执行该子句，否则执行`default`子句。
+### 数据结构
+```go
+type scase struct {
+  c *hchan
+  elem unsafe.Pointer // 接收或发送数据的地址
+  kind uint16 // runtime.scase的种类
+  pc unintptr
+  releasetime int64
+}
+```
+`kind`的种类如下：
+```go
+const (
+  caseNil = iota
+  caseRecv
+  caseSend
+  caseDefault
+)
+```
+`channel`的两个顺序：
+1. 轮询顺序，通过`runtime.fastrandn`函数引入随机性；
+2. 按照`Channel`的地址排序后确定加锁顺序。
+
+### `defer`
+`defer`数据结构：
+```go
+type _defer struct{
+  siz int32 // 参数与结果内存大小
+  started bool 
+  sp uintptr // 栈指针
+  pc uintptr // 调用方计数器
+  fn *funcval // defer中传入的函数
+  _panic *_panic // 触发延迟调用的结构体，可能为空
+  link *_defer
+}
+```
+`GO`语言中将`defer`组装成一个`link`。
+![deferlink](./images/deferlink.png)
+`defer`关键字插入时是从后向前，`defer`关键字的执行是从前向后。
+### `panic`与`recover`
+相关现象：
+* `panic`只会触发当前`Goroutine`的延迟函数调用
+* `revcver`只有在`defer`函数调用中才会生效
+* `panic`允许在`defer`中多次嵌套调用
+#### 数据结构
+```go
+type _panic struct {
+  argp unsafe.Pointer  // 指向defer调用的参数指针
+  arg interface{} // 指向panic时传入的参数
+  link *_panic // 指向更早调用runtime._panic的结构
+  recovered bool // 当前runtime._panic是否被recover恢复
+  aborted bool // 当前runtime._panic是否被强制终止
+  pc uintptr
+  sp unsafe.Pointer
+  goexit bool
+}
+```
+结构体中`pc、sp和goexit`是为了修复`runtime.Goexit`问题引入的。
+#### 程序崩溃
+编译器将关键字`panic`装换成`runtime.gopanic`。该函数执行以下步骤：
+1. 创建`runtime._panic`结构并添加到所在`Goroutine _panic`链表的最前端；
+2. 在循环中不断从当前`Goroutine`的`_defer`链表中获取`runtime._defer`并调用`runtime.reflectcall`运行延迟调用函数；
+3. 调用`runtime.fatalpanic`中止整个程序。
 
 
-
+### `make和new`
+* `make`初始化内置数据；
+* `new`根据传入的类型在堆上分配一片内存空间，并返回指向这片内存空间的指针。
 
 
 
