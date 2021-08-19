@@ -337,6 +337,136 @@ type _panic struct {
 * `make`初始化内置数据；
 * `new`根据传入的类型在堆上分配一片内存空间，并返回指向这片内存空间的指针。
 
+### 上下文`Context`
+`Context`不但可以用来设置截止日期、同步型号还可以用来传递请求的相关值。
+`Context`的主要作用就是在不同的`Goroutine`之间同步特定的数据、取消信号以及处理请求的截止日期。
+每一个`Context`会从最顶层的`Goroutine`逐层传递到最下层。
+#### 接口
+```go
+type Context struct{
+  Deadline() (deadline time.Time, ok bool)
+  Done() <- chan struct{}
+  Err() Error
+  Value(key interface{}) interface{}
+}
+```
+分析：
+1. `Deadline()`返回当前`Context`被取消的时间，即完成工作的截止日期；
+2. `Done()`方法返回一个`Channel`，这个`Channel`会在当前工作完成或者上下文被取消后关闭，多次调用`Done()`方法会返回同一个`Channel`；
+3. `Err()`返回当前`Context`结束的原因，它只会在`Done`返回的`Channel`关闭时才返回非空的值；
+  > * 如果当前`Context`被取消就会返回`Canceled`;
+  > * 如果当前`Context`超时就返回`DeadlineExceeded`。
+
+4. `Value`方法会从`Context`放回对应的键值，对同一个`key`多次调用`Value`会返回相同的值。
+
+#### 实现原理
+##### 默认上下文
+在`context`包中，最常用的还是`context.Background`和`context.TODO`两个方法，这两个方法最终返回一个预先初始化好的私有变量`backgroud和todo`:
+```go
+func Background(){
+  return background
+}
+
+func TODO(){
+  return todo
+}
+```
+这两个变量是在包初始化时被创建好的，通过`new(emptyCtx)`表达式初始化的指向私有结构体`emptyCtx`的指针。
+```go
+type emptyCtx int
+func (*emptyCtx) Deadline()(deadline time.Time,ok bool ) {
+  return
+}
+
+func (*emptyCtx) Done() <- chan struct{}{
+  return nil
+}
+
+func (*emptyCtx) Err() error{
+  return nil
+}
+
+func (*emptyCtx) Value(key interface{}) interface{}{
+  return nil
+}
+
+```
+### 同步原语与锁
+#### `Mutex`
+```go
+type Mutex struct{
+  state int32 // 当前互斥锁的状态
+  sema int32 // 控制锁状态的信号量
+}
+```
+共占`8`字节大小。
+互斥锁的状态使用`int32`表示，但锁的状态不是互斥的，而是有三种状态：`mutexLocked, mutexWoken和mutexStarving`。
+剩下位置表示有多少个`Goroutine`等待互斥锁释放。
+![golangmutexstate](./images/gomutexstate.png)
+互斥锁创建时，所有的位都为`0`,当互斥锁被锁定时 `mutexLocked`就会被置成    `1`、当互斥锁被在正常模式下被唤醒时`    mutexWoken   `就会被被置成 `   1  `、  ` mutexStarving   `用于表示当前的互斥锁进入了状态,最后的几位是在当前互斥锁上等待的` Goroutine `个数。
+#### 饥饿模式
+互斥锁有两种模式: **正常模式与饥饿模式**。
+在正常模式下：所有的`Goroutine`按照先进先出的顺序获取锁，但一个刚刚唤醒的`Goroutine`遇到一个新的`Goroutine`也调用了`Lock`方法，大概率不会获取到锁。
+为避免上述情况发生，防止`Goroutine`被饿死，一旦`Goroutine`超过`1ms`没有获取到锁就会切换到饥饿模式。
+饥饿模式下：锁优先分配给等待队列的队头部分的`Goroutine`，新的`Goroutine`不能获取到锁也不会进入到自旋状态，只会在末尾等待。当队列最后一个`Goroutine`获取到锁或者等待时间小于`1MS`时，进入正常状态。
+#### 加锁
+自旋锁只要是防止在多`CPU`机器上，避免并发造成的异常。
+当一个线程获取锁时，如果锁已被获取，那么线程将循环等待，并不断试探是否能够获取锁，直到获取到锁退出循环。
+#### `RWMutexLock`
+```go
+type RWMutexLock struct {
+  w Mutex
+  writerSem uint32
+  readerSem uint32
+  readerCount int32
+  readerWait int32
+}
+```
+加读锁流程：
+![加读锁](./images/加读锁.png)
+解读锁流程：
+![解读锁](./images/解读锁.png)
+加写锁流程：
+![加写锁](./images/加写锁.png)
+解写锁流程：
+![解写锁](./images/释放写锁.png)
+#### `WaitGroup`
+多用于批量执行`RPC`或调用外部服务。
+```go
+type WaitGroup struct {
+  noCopy noCopy // 限制拷贝操作
+  state1 [3]uint32
+}
+```
+`noCopy`实现：
+```go
+type noCopy struct{}
+
+func (*noCopy) Lock(){}
+func (*noCopy) UnLock(){}
+```
+通过`go vet`检查。
+陷入睡眠的`Goroutine`会在`Add`方法在计数器为`0`时唤醒。
+
+#### `Cond`
+```go
+type Cond struct {
+  noCopy noCopy // 保证编译期间不会copy
+  L Locker // 接口，任意实现Lock和UnLock的方法，都可以作为NewCond方法的参数
+  notify notifyList // 等待通知列表
+  checker copyChecker // 保证运行期间不会copy， 否则panic
+}
+```
+`notifyList`结构体：
+```go
+type notifyList struct {
+  wait int32
+  notify int32
+  lock mutex
+  head *sudog
+  tail *sudog
+}
+```
 
 
 
