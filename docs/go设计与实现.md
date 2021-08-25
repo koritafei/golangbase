@@ -467,8 +467,211 @@ type notifyList struct {
   tail *sudog
 }
 ```
+### 定时器
+#### `timer`
+`timer`是`golang`定时器的内部表示，每一个`timer`都存储在一个堆中。
+```go
+struct timer struct{
+  tb *timersBucket // 存储当前定时器的桶
+  i int // 当前定时器在堆中索引
 
+  when int64 // 当前定时器被唤醒时间
+  peroid int64 // 两次被唤醒的间隔
+  f func(interface{}, uintptr) // 唤醒定时器运行函数
+  arg interface{} 
+  seq uintptr
+}
+```
+定时器对外接口：
+```go
+type Timer struct {
+  c <- chan Time
+  r runtimeTimer
+}
+```
+`timersBucket`存储一个处理器上的全部定时器，如果机器上的处理器超过了`64`个，多个处理器的定时器可能存储在同一个桶中。
+```go
+type timersBucket struct {
+  lock mutex
+  gp *g
+  created bool
+  sleeping bool
+  rescheduling bool
+  sleepUtil int64
+  waitnote note
+  t []*timer // 存储定时器切片
+}
+```
+每一个运行的`GO`程序都会在内存中存储着`64`个桶，这些桶中存储定时信息。
+结构体中的`timer`是一个最小堆结构，存储着最近需要唤醒的定时器。
+#### `Ticker`
+```go
+type Ticker struct { // 多次触发事件计时器
+  C <- chan Time  // 接收通知的Channel
+  r runtimeTimer // 定时器
+} 
+```
+### `Channel`
+`Channel`模型，可以理解为**生产者--消费者模型**，对需要手动封装的`队列，同步原语`等打包封装的结果。
+#### 数据结构
+```go
+type hchan struct {
+  qcount uint
+  dataqsiz uint
+  buf unsafe.Pointer
+  elemsize uint16
+  closed uint32
+  elemtype *_type
+  sendx uint
+  recvx uint
+  recvq waitq
+  sendq waitq
 
+  lock mutex
+}
+```
+`waitq`结构：
+```go
+type waitq struct {
+  first *sudoq
+  last *sudoq
+}
+```
+![发送消息处理流程](./images/发送消息处理流程.png)
+![执行过程](./images/执行过程.png)
+当我们向 `Channel` 发送消息并且 `Channel` 中存在处于等待状态的`Goroutine` 协程时,就会执行以下的过程: 
+* 调用    `sendDirect`  函数将发送的消息拷贝到接收方持有的目标内存地址上; * 将接收方 `Goroutine` 的状态修改成    `Grunnable`  并更新发送方所在处理器 `P` 的    `runnext`  属性,当处理器`P` 再次发生调度时就会优先执行    `runnext`  中的协程;
+* 需要注意的是,每次遇到这种情况时都会将    `recvq`  队列中的    `sudog`  结构体出队;
+* 除此之外,接收方 `Goroutine` 被调度的时机也十分有趣,通过阅读源代码我们其实可以看到在发送的过程中其实只是将接收方的 `Goroutine` 放到了    `runnext`  中,实际上 `P` 并没有立刻执行该协程,作者使用以下的代码来验证调度发生的时机.
+![向未满缓冲区写入数据](./images/向未满缓冲区写入数据.png)
+![接收数据流程](./images/接收数据流程.png)
+
+### `Goroutine`
+#### 数据结构
+![协程模型](./image/../images/go协程模型.png)
+`M`--操作系统线程，被操作系统管理的线程，与`POSIX`中的标准线程十分相似；
+`G`--`Goroutine`，每一个`Goroutine`都包含一个堆栈、指令指针和其他用于调度的重要信息；
+`P`--调度上下文，运行于线程`M`上的本地调度器。
+#### `G`
+##### 结构体
+```go
+type g struct {
+  m *m
+  sched gobuf
+  syscallsp uintptr
+  syscallpc uintptr
+  param unsafe.Pointer
+  atomicstatus uint32
+  goid int64
+  schedlink guintptr
+  waitsince int64
+  waitreason waitReason
+  preempt bool
+  lockedm muintptr
+  writebuf []byte
+  sigcode0 uintptr
+  sigcode1 uintptr
+  sigpc uintptr
+  gopc uintptr
+  startpc uintptr
+  waiting *sudog
+}
+```
+`atomicstatus`存储了当前`Goroutine`状态:
+
+|     状态      |                                          描述                                           |
+| :-----------: | :-------------------------------------------------------------------------------------: |
+|   `_Gidle`    |                                刚刚被分配且没有被初始化                                 |
+|  `_Grunnble`  |                      没有执行代码，没有栈的所有权，存储在运行队列                       |
+|  `_Grunning`  |                可以执行代码，有栈的所有权，分配了内核线程`M`和处理器`P`                 |
+|  `_Gsyscall`  | 正在执行系统调用，拥有栈的所有权，没有执行用户代码，被赋予了内核线程`M`但不在运行队列上 |
+| `_Gwaitting`  |   由于运行时被阻塞，没有执行用户代码不在运行队列上，但可能存在在`Channel`的等待队列上   |
+|   `_Gdead`    |                        没有被使用，没有执行代码，可能有分配的栈                         |
+| `_Gcopystack` |                       栈正在被拷贝，没有执行代码，不在运行队列中                        |
+在运行期间我们会在这三种不同的状态来回切换: 
+* 等待中:表示当前 Goroutine 等待某些条件满足后才会继续执行,例如当前 Goroutine 正在执行系统调用或者同步操作; 
+* 可运行:表示当前 Goroutine 等待在某个 M 执行 Goroutine 的指令,如果当前程序中有非常多的Goroutine,每个 Goroutine 就可能会等待更多的时间; 
+* 运行中:表示当前 Goroutine 正在某个 M 上执行指令;
+
+#### `M`
+`golang`在默认情况下最大允许`10000`线程调度。
+在默认情况下,一个四核机器上会创建四个操作系统线程,每一个线程其实都是一个    `m`   结构体,我们也可以通过  `runtime.GOMAXPROCS`   改变最大可运行线程的数量,我们可以使用    `runtime.GOMAXPROCS(3)`   将 Go 程序中的线程数改变成 `3` 个。
+在大多数情况下,我们都会使用 `Go` 的默认设置,也就是   ` #thread == #CPU ` ,在这种情况下不会触发操作系统级别的线程调度和上下文切换,所有的调度都会发生在用户态,由 `Go` 语言调度器触发,能够减少非常多的额外开销。
+#### 结构体
+```go
+type m struct {
+  g0 *g // 持有调度堆栈的goroutine
+  curg *g // 当前线程上运行的goroutine
+  // ...
+}
+```
+#### `P`
+`P(处理器)`线程上下文环境，即处理代码逻辑的处理器。
+,通过处理器` P `的调度,每一个内核线程` M `都能够执行多个` G`,这样就能在` G` 进行一些` IO` 操作时及时对它们进行切换,提高` CPU `的利用率。
+每一个` Go `语言程序中所以处理器的数量一定会等于   ` GOMAXPROCS`  ,这是因为调度器在启动时就会创建  `GOMAXPROCS `  个处理器` P`,这些处理器会绑定到不同的线程` M `上并为它们调度` Goroutine`。
+#### 结构体
+```go
+type p struct {
+  id int32
+  status uint32
+  link puintptr
+  schetick uint32
+  syscalltick uint32
+  sysmontick sysmontick
+  m mintptr
+  mcache *mcache
+  runhead uint32
+  runtail uint32
+  runq [256]gunintptr
+  runnext guintptr
+  sudogcache []*sudog
+  sudogbuf [128]*sudog
+
+   ...
+}
+```
+#### 状态
+`p`结构体中的状态`status`有如下状态：
+|    状态     |                                     描述                                     |
+| :---------: | :--------------------------------------------------------------------------: |
+|  `_Pidle`   | 处理器没有运行用户代码或者调度器，被空闲队列或者改变其状态持有，运行队列为空 |
+| `_Prunning` |                  被线程`M`持有，并正在执行用户代码或调度器                   |
+| `_Psyscall` |                    没有执行用户代码，当前线程陷入系统调用                    |
+| `_Pgcstop`  |                 被线程`M`持有，当前处理器由于来及回收被停止                  |
+|   `_Pead`   |                            当前处理器已经不被处理                            |
+
+#### 实现原理
+`go`关键字会被转成`newproc`调用，我们向`newproc`中传入一个表示函数的指针`funcval`。
+`newproc1`函数的作用是创建一个运行传入参数`fn`的`g`结构体。
+`newproc1`函数的执行过程可以分为以下的步骤：
+* 获取当前`Goroutine`对应的处理器`P`并从它的列表中取出一个空闲的`Goroutine`,如果当前不存在`goroutine`, 就会通过`malg`方法重新分配一个`g`结构体，并将它的状态从`_Gidle`变为`_Gdead`。
+* 获取新创建的`Goroutine`的堆栈并直接通过`memmove`将函数`fn`所需要的参数全部拷贝到栈中；
+* 初始化新`Goroutine`的栈指针、程序计数器、调用方程序计数器等属性；
+* 将新 `Goroutine` 的状态从   ` _Gdead ` 切换成   ` _Grunnable`  并设置 `Goroutine` 的标识符(`goid`);   
+* `runqput ` 函数会将新的 `Goroutine `添加到处理器` P `的结构体中; 
+* 如果符合条件,当前函数会通过    `wakep ` 来添加一个新的  `  p ` 结构体来执行 `Goroutine`;
+### 获取结构体
+通过两种不同方法获取`g`结构体：
+> * 直接从当前`Goroutine`所在的处理器的`p.gFree`列表或者调度器的`sched.gFree`列表中获取`g`结构体；
+> * 通过`malg`生成一个新的结构体并将当前结构体追加到全局的`Goroutine`列表的`allgs`。
+>
+![getgoroutine](./images/getgoroutine.png)
+**`golang`的协程栈大小一般为`1KB`。**
+#### 运行队列
+通过调用`runqput`函数将当前的`Goroutine`添加到处理器`P`的运行队列上。
+运行队列是一个环形链表，最多能够存储`256`个指向`Goroutine`的指针。
+`runnext`存储了下一个被运行的`Goroutine`。
+`runqput`函数流程：
+1. 当`next=true`时将`Goroutine`设置到处理器的`runnext`上作为下一个执行的`Gorountine`；
+2. 当`next=false`并且运行队列还有剩余空间时，将`Goroutine`加入到处理器持有的本地运行队列;
+3. 当处理器的本地运行队列已经没有剩余空间时，把本地队列中的一部分`Goroutine`和待加入的`Goroutine`通过`runqputslow`添加到调度器持有的全局队列上。
+
+![golangrunqueue](./images/golangrunqueue.png)
+
+#### `Goroutine`调度
+`gopark`函数使得当前`Goroutine`让出处理器。
+#### 系统调用
+![golang系统调用](./images/golang系统调用.png)
 
 
 

@@ -5,7 +5,7 @@ import (
 	"unsafe"
 )
 
-func main() {
+func main6() {
 	v1 := struct {
 		a byte
 		b byte

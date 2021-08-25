@@ -18,7 +18,7 @@ func ToString(s []byte) string {
 	return *(*string)(unsafe.Pointer(&s))
 }
 
-func main() {
+func main5() {
 	bs := []byte("hello world")
 	s := ToString(bs)
 	fmt.Println(s)

@@ -22,6 +22,7 @@ func main() {
 			fmt.Println("Exists")
 		} else {
 			fmt.Println("First Set")
+			fmt.Printf("err %v\n", err)
 		}
 
 		if err != nil {

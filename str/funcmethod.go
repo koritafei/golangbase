@@ -36,7 +36,7 @@ func methodSet(a interface{}) {
 	}
 }
 
-func main() {
+func main2() {
 	var tt T
 
 	methodSet(tt)

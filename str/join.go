@@ -2,8 +2,8 @@ package main
 
 import (
 	"bytes"
-	"strings"
 	"fmt"
+	"strings"
 )
 
 func testJoin() string {
@@ -25,7 +25,7 @@ func testByteBuffer() string {
 	return b.String()
 }
 
-func main() {
+func main4() {
 	fmt.Println(testJoin())
 	fmt.Println(testByteBuffer())
 }
