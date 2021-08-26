@@ -672,6 +672,89 @@ type p struct {
 `gopark`函数使得当前`Goroutine`让出处理器。
 #### 系统调用
 ![golang系统调用](./images/golang系统调用.png)
+### 网络轮询器
+#### 设计原理
+网络轮询器不仅能用于监控网络`I/O`,还能用于监控文件`I/O`。
+#### `I/O`模型
+操作系统提供了阻塞`I/O`、非阻塞`I/O`、信号驱动`I/O`与异步`I/O`以及`I/O`多路复用。
+##### 阻塞`I/O`
+阻塞`I/O`对文件和网络的读写默认是阻塞的，通过以下系统调用对文件进行读写时，系统会阻塞：
+```cpp
+ssize_t read(int fd, void *buf, size_t count);
+ssize_t write(int fd, const void *buf, size_t nbytes);
+```
+![阻塞IO模型](./images/阻塞IO模型.png)
+##### 非阻塞`I/O` 
+当一个进程把一个文件描述符设置成非阻塞时，执行`read和write`等`I/O`操作时就会立刻返回。
+```cpp
+int flag = fcntl(fd, F_GETFL, 0);
+fcntl(fd, F_SETFL, flag|O_NONBLOCK);
+```
+![非阻塞IO](./images/非阻塞IO模型.png)
+需要不断轮询。
+#### `I/O`多路复用
+用来处理同一个时间循环中的多个`I/O`事件。
+![IO多路复用](./images/IO多路复用.png)
+阻塞的监听一组文件描述符，当文件描述符状态变为可读或可写时，`select`就会返回可读或可写时间的个数，应用程序就可以在输入的文件描述符中查找哪些是可读或可写的，进行操作。
+#### 多模块
+`select`的限制：
+> 1. 监听能力有限，最多监听$1024$个文件描述符；
+> 2. 内存拷贝开销大，需要维护一个较大的数据结构存储文件描述符，该结构需要拷贝到内核中；
+> 3. 时间复杂度$O(n)$, 返回就绪的事件个数后，需要遍历所有的文件描述符。
 
+`epoll、kqueue和solaries` 等多路复用模块都要实现以下函数：
+```go
+func netpollinit() // 初始化网络轮询器，通过sync.Once和netpollInited保证函数只被调用一次
+func netpollopen(fd uintptr, pd *pollDesc)int32 // 监听文件描述符上的边缘事件，创建事件并加入监听
+// 轮询网络并返回一组已经就绪的goroutine, 传入参数决定其行为
+// 如果参数小于0， 无限期等待文件描述就绪
+// 如果参数等于0， 非阻塞的轮询网络
+// 如果参数大于0， 阻塞特定时间轮询网络
+func netpoll(delta int64) gList
+func netpollBreak() // 唤醒网络轮询器
+func netpollIsPollDescriptor(fd uintptr) bool // 判断文件描述符是否被轮询器使用
+```
+#### 数据结构
+```go
+type pollDesc struct {
+  link *pollDesc
+  lock mutex
+  fd uintptr
+  ...
+  rseq uintptr
+  rg uintptr
+  rt timer
+  rd int64
+  wseq uintptr
+  wg uintptr
+  wt timer
+  wd int64
+}
+```
+`runtime.pollDesc`结构体会使用`link`字段串联成一个链表，存储在`runtime.pollCache`中：
+```go
+type pollCache struct {
+  lock mutex
+  first *pollDesc
+}
+```
+![轮询缓存链表](./images/轮询缓存链表.png)
+`runtime.pollCache`是运行时包中的缓存变量，该结构体中包含了一个用于保护轮询数据的互斥锁和链表头。
+#### 多路复用
+##### 初始化
+1. `internal/poll.pollDesc.init`--通过`net.netFD.init`和`os.newFile`初始化网络`I/O`和文件`I/O`的轮询信息时；
+2. `runtime.doaddtimer`--向处理器中增加计时器时。
+
+网络轮询器初始化会调用`runtime.poll_runtime_pollServerInit和runtime.netpollGenericInit`函数。
+
+`runtime.netpollGenericInit `  会调用平台上特定实现的    `runtime.netpollinit `  函数,即` Linux `上的   ` epoll`  , 它主要做了以下几件事情:
+ 1.  是调用    `epollcreate1 ` 创建一个新的    `epoll`  文件描述符,这个文件描述符会在整个程序的生命周期中使用; 
+2.  通过    `runtime.nonblockingPipe`  创建一个用于通信的管道; 
+3.   使用    `epollctl ` 将用于读取数据的文件描述符打包成   ` epollevent ` 事件加入监听;
+
+##### 轮询事件
+调用   ` internal/poll.pollDesc.init `  初始化文件描述符时不止会初始化网络轮询器,还会通过  `runtime.poll_runtime_pollOpen`   函数重置轮询信息    `runtime.pollDesc  ` 并调用    `runtime.netpollopen `  初始化轮询事件.
+### 系统监控
+![golang系统](./images/golang系统.png)
 
 
