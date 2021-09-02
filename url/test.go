@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 )
 
 func main() {
@@ -17,4 +18,9 @@ func main() {
 	fmt.Println(re.MatchString(str))
 	str = re.ReplaceAllString(str, "sdfsdf")
 	fmt.Println(str)
+
+	t, err := strconv.ParseInt("", 10, 64)
+
+	fmt.Printf("t %v, err %v\n", t, err)
+
 }

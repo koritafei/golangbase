@@ -756,5 +756,132 @@ type pollCache struct {
 调用   ` internal/poll.pollDesc.init `  初始化文件描述符时不止会初始化网络轮询器,还会通过  `runtime.poll_runtime_pollOpen`   函数重置轮询信息    `runtime.pollDesc  ` 并调用    `runtime.netpollopen `  初始化轮询事件.
 ### 系统监控
 ![golang系统](./images/golang系统.png)
+### 内存分配器
+#### 设计原理
+内存管理一半包括三个组件，分别为用户程序(`Mutator`)、分配器(`Alloator`)和收集器(`Collector`), 当用户申请内存时，它会通过内存分配器申请新的内存。
+![内存管理](./images/内存管理.png)
+#### 分配方法
+编程语言分配器主要包含以下两种：
+1. 线性分配器(`Sequential Allocator, Bump Alloator`)
+2. 空闲链表分配器(`Free-List Allocator`)
+
+##### 线性分配器
+当我们在编程语言中使用线性分配器,我们只需要在内存中维护一个指向内存特定位置的指针,当用户程序申请内存时,分配器只需要检查剩余的空闲内存、返回分配的内存区域并修改指针在内存中的位置,即移动下图中的指针:
+![线性分配器](./images/线性分配器.png)
+优点： 高效，效率较高。
+缺点： 容易产生内存碎片，回收算法复杂。
+##### 空闲链表分配器
+空闲链表分配器(`Free-List Allocator`)可以重用已经被释放的内存,它在内部会维护一个类似链表的数据结构。当用户程序申请内存时,空闲链表分配器会依次遍历空闲的内存块,找到足够大的内存,然后申请新的资源并修改链表。
+![空闲链表](./images/空闲链表分配器.png)
+空闲链表分配器可以选择不同的策略在链表中的内存块中进行选择,最常见的就是以下四种方式: 
+* 首次适应(`First-Fit`) 从链表头开始遍历,选择第一个大小大于申请内存的内存块; 
+* 循环首次适应(`Next-Fit`) 从上次遍历的结束位置开始遍历,选择第一个大小大于申请内存的内存块; 
+* 最优适应(`Best-Fit`) 从链表头遍历整个链表,选择最合适的内存块; 
+* 隔离适应(`Segregated-Fit`) 将内存分割成多个链表,每个链表中的内存块大小相同,申请内存时先找到满足条件的链表,再从链表中选择合适的内存块;
+
+![隔离适应策略](./images/隔离适应策略.png)
+#### 分级分配
+`Go` 语言的内存分配器会根据申请分配的内存大小选择不同的处理逻辑,运行时根据对象的大小将对象分成微对象、小对象和大对象三种：
+
+|  类别  |     大小      |
+| :----: | :-----------: |
+| 微对象 |  `(0, 16B)`   |
+| 小对象 | `[16B, 32KB]` |
+| 大对象 | `(32KB, +∞)`  |
+
+#### 多级缓存
+内存分配器不仅会区别对待大小不同的对象,还会将内存分成不同的级别分别管理,`TCMalloc` 和 `Go` 运行时分配器都会引入线程缓存(`Thread Cache`)、中心缓存(`Central Cache`)和页堆(`Page Heap`)三个组件分级管理内存。
+![多级缓存](./images/多级缓存.png)
+### `Go`虚拟内存
+三个区域   ` spans`  、  ` bitmap   和  arena`   分别预留了 `512MB、16GB 以及 512GB `的内存空间,这些内存并不是真正存在的物理内存,而是虚拟内存.
+![堆线性内存](./images/堆线性内存.png)
+`Go` 语言在垃圾回收时会根据指针的地址判断对象是否在堆中,并通过上一段中介绍的过程找到管理该对象的 ` runtime.mspan`  。这些都建立在堆区的内存是连续的这一假设上。这种设计虽然简单并且方便,但是在` C 和 Go `混合使用时会导致程序崩溃: 
+1.  分配的内存地址会发生冲突,导致堆的初始化和扩容失败; 
+2.  没有被预留的大块内存可能会被分配给` C `语言的二进制,导致扩容后的堆不连续.
+
+#### 稀疏内存
+![二维稀疏内存](./images/二位稀疏内存.png)
+#### 地址空间
+内存管理层，将内存分为如下的状态：
+
+|    状态    |                                               解释                                                |
+| :--------: | :-----------------------------------------------------------------------------------------------: |
+|   `None`   |                             内存没有被保留或者映射，地址空间默认状态                              |
+| `Reserved` |                               运行时持有该空间地址，当访问时会报错                                |
+| `Prepared` | 内存被保留，一般没有对应的对应的物理内存，访问该片内存的行为是未定义的，可以快速转换到`Ready`状态 |
+|  `Ready`   |                                         可以被安全的访问                                          |
+![内存状态转换](./images/内存状态装换.png)
+* `runtime.sysAlloc ` 会从操作系统中获取一大块可用的内存空间,可能为几百 KB 或者几 MB;   
+* `runtime.sysFree  `会在程序发生内存不足(`Out-of Memory,OOM`)时调用并无条件地返回内存;   
+* `runtime.sysReserve ` 会保留操作系统中的一片内存区域,对这片内存的访问会触发异常;   
+* `runtime.sysMap ` 保证内存区域可以快速转换至准备就绪;   
+* `runtime.sysUsed`  通知操作系统应用程序需要使用该内存区域,需要保证内存区域可以安全访问;   
+* `runtime.sysUnused`  通知操作系统虚拟内存对应的物理内存已经不再需要了,它可以重用物理内存;  
+* `runtime.sysFault`  将内存区域转换成保留状态,主要用于运行时的调试。
+
+##### 内存管理组件
+`GO`语言的内存分配器包含内存管理单元、线程缓存、中心缓存和页堆几个重要组件。对应的数据结构    `runtime.mspan  、   runtime.mcache  、   runtime.mcentral   和    runtime.mheap`。
+![golang内存结构](./images/go内存程序布局.png)
+所有的 `Go` 语言程序都会在启动时初始化如上图所示的内存布局,每一个处理器都会被分配一个线程缓存  `runtime.mcache  ` 用于处理微对象和小对象的分配,它们会持有内存管理单元   ` runtime.mspan ` 。
+每个类型的内存管理单元都会管理特定大小的对象,当内存管理单元中不存在空闲对象时,它们会从  `runtime.mheap  ` 持有的 `134 `个中心缓存   ` runtime.mcentral `  中获取新的内存单元,中心缓存属于全局的堆结构体 ` runtime.mheap  `,它会从操作系统中申请内存。
+#### 内存管理单元
+`runtime.mspan`是`Go`语言的内存管理单元，该结构体中含有`next和prev`分别指向下一个和前一个`runtime.mspan`。
+```go
+type mspan struct {
+  next *mspan
+  prev *mspan
+  ...
+}
+```
+![内存管理链表](./images/内存管理单元链表.png)
+运行时使用`runtime.mSpanList`存储双向链表的头结点和尾结点并在线程缓存和中心缓存中使用。
+因为相邻的管理单元会互相引用,所以我们可以从任意一个结构体访问双向链表中的其他节点。
+##### 页和内存
+每个`runtime.mspan`都管理`npages`个`8KB`大小的页。是操作系统系统内存页，是操作系统内存页的整数倍，该结构体使用以下字段来管理内存页的分配和回收。
+```go
+type mspan struct {
+  startAddr uintptr // 起始地址
+  npages uintptr // 页数
+  freeindex uintptr
+  allocBits *gcBits
+  gcmarkBits *gcBits
+  allocCache uint64
+  ...
+}
+```
+* `startAddr  和    npages ` — 确定该结构体管理的多个页所在的内存,每个页的大小都是 `8KB`;  
+* ` freeindex`  — 扫描页中空闲对象的初始索引;  
+* ` allocBits  和    gcmarkBits ` — 分别用于标记内存的占用和回收情况;   
+* `allocCache  —    allocBits  `的补码,可以用于快速查找内存中未被使用的内存;  
+ 
+` runtime.mspan   `会以两种不同的视角看待管理的内存,当结构体管理的内存不足时,运行时会以页为单位向堆申请内存。
+![内存管理单元](./images/内存管理单元.png)
+当用户程序或者线程向   ` runtime.mspan `  申请内存时,该结构会使用    `allocCache `  字段以对象为单位在管理的内存中快速查找待分配的空间:
+![内存管理单元与对象](./images/内存管理单元与对象.png)
+
+### 状态
+运行时会使用    `runtime.mSpanStateBox `  结构体存储内存管理单元的状态    `runtime.mSpanState`  :
+```go
+type mspan struct { 
+        ...
+      state       mSpanStateBox 
+            ...
+  } 
+```
+该状态可能处于   ` mSpanDead  、   mSpanInUse  、   mSpanManual   和    mSpanFree `  四种情况。当   ` runtime.mspan `  在空闲堆中,它会处于    `mSpanFree`   状态;当   ` runtime.mspan`   已经被分配时,它会处于  `mSpanInUse  、   mSpanManual   `状态,这些状态会在遵循以下规则发生转换: 
+* 在垃圾回收的任意阶段,可能从    `mSpanFree  转换到    mSpanInUse  和    mSpanManual `; 
+* 在垃圾回收的清除阶段,可能从   ` mSpanInUse  和    mSpanManual ` 转换到   ` mSpanFree `; 
+* 在垃圾回收的标记阶段,不能从   ` mSpanInUse  和    mSpanManual  转换到    mSpanFree `; 
+
+
+设置    `runtime.mspan `  结构体状态的读写操作必须是原子性的避免垃圾回收造成的线程竞争问题。
+
+### 线程缓存
+`runtime.mcache`是`Go`语言中的线程缓存，与线程上的处理器一一绑定，主要用来缓存用户程序申请的微小对象。
+每个线程持有`67 * 2`个`runtime.mspan`，这些内存管理单元都存储在结构体的`alloc`中：
+![mcache_mspans](./images/mcache_mspans.png)
+
+
+
 
 
